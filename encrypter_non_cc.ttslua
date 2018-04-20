@@ -1,0 +1,1600 @@
+-- Simple API for encrypting strings.
+-- Lua AES code from https://github.com/bighil/aeslua
+---  Note: https://github.com/SquidDev-CC/aeslua is buggy for long strings. Do not use.
+-- lua Base64 code from http://lua-users.org/wiki/BaseSixtyFour
+-- Lua bitwise code from http://lua-users.org/wiki/BitUtils
+-- Padlock image from https://commons.wikimedia.org/wiki/File:Padlock-bronze-open_and_silver-medium.svg
+-- Imported to TTS by Sai (saizai)
+-- Source: https://github.com/saizai/tts_encrypter
+
+-- Notes:
+-- 1. It's SLOW. 
+--	 		Seriously. Lua is not meant to handle crypto, and this is pure Lua (because TTS doesn't even provide the bit library).
+-- 			So, yes, you can do AES256. But it'll take a while.
+--      It will take significant time, and make TTS unresponsive for a while, even in the best of circumstances. Just let it run.
+-- 2. It's lazy loaded to reduce impact.
+--      Booting up the encryption libraries takes some time. They aren't actually loaded until you use an encrypt or decrypt function. This saves load time dramatically, but it'll choke up when you first use it.
+
+
+--- Hopefully removable:
+-- 2. It's buggy.
+--      Strings longer than 256 chars, especially in modes other than 3 (OFB), do not work right. They decrypt lossily. I don't know why.
+--      In the meantime, I'm limiting it to mode 3, and chopping it up into 256 char chunks.
+-- 3. It's not very secure.
+--      The workaround to #2 - using OFB and separate 256-char chunks encrypted with the same key - makes this more vulnerable than if it were encrypted as a whole.
+--      This is TTS, not Signal. Don't use it for something serious.
+
+
+-- 
+-- -- Call like so:
+-- local text = {
+-- 	["password"] = "Mellon",
+-- 	["data"] = "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi? Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur?"
+-- }
+-- cyphertext = Global.getVar("encryptProvider").call("encrypt", text)
+-- print(cyphertext)
+-- -- encrypt returns base64 encoded string
+-- text['data'] = cyphertext
+-- plaintext = Global.getVar("encryptProvider").call("decrypt", text)
+-- print(plaintext)
+-- -- decrypt gives an error if wrong pass or wrong cyphertext, plaintext string otherwise
+
+-- -- This item also provides Base64 encode/decode functions. They're already used for the encryption.
+-- encoded = Global.getVar("encryptProvider").call("b64_encode", {[1] = "string to encode"})
+-- print(encoded)
+-- decoded = Global.getVar("encryptProvider").call("b64_decode", {[1] = "c3RyaW5nIHRvIGVuY29kZQ=="})
+-- print(decoded)
+
+-- Optional encryption/decryption parameters (use constants below):
+-- keyLength - length of aes key: 128(default), 192 or 256 Bit
+
+-- DISABLED until proven to work consistently in modes other than 3
+-- mode      - mode of encryption: ecb, cbc(default), ofb, cfb
+-- mode and keyLength must be the same for encryption and decryption.
+
+aesLua_x = function()
+	local private = {};
+	local public = {};
+	aeslua = public;
+	
+	public.AES128 = 16; -- default
+	public.AES192 = 24;
+	public.AES256 = 32;
+
+	public.ECBMODE = 1;
+	public.CBCMODE = 2; -- aeslua default
+	public.OFBMODE = 3; --- forced default
+	public.CFBMODE = 4;
+	
+	--
+	-- Everything after this is internal. Here be dragons.
+	--
+	
+	-- splitlen = 4096;
+	-- forcedmode = 3;
+	
+	bit_x = function()
+		--[[
+			This bit API is designed to cope with unsigned integers instead of normal integers
+
+			To do this we add checks for overflows: (x > 2^31 ? x - 2 ^ 32 : x)
+			These are written in long form because no constant folding.
+		]]
+
+		local floor = math.floor
+
+		local lshift, rshift
+
+		
+		rshift = function(a,disp)
+			return floor(a % 4294967296 / 2^disp)
+		end
+
+		lshift = function(a,disp)
+			return (a * 2^disp) % 4294967296
+		end
+
+		-- http://lua-users.org/wiki/BitUtils
+		local function nand(x,y,z)
+		    z=z or 2^16
+		    if z<2 then
+		        return 1-x*y
+		    else
+		        return nand((x-x%z)/z,(y-y%z)/z,math.sqrt(z))*z+nand(x%z,y%z,math.sqrt(z))
+		    end
+		end
+		
+		bnot = function(y,z)
+		    return nand(nand(0,0,z),y,z)
+		end
+		band = function(x,y,z)
+		    return nand(bnot(0,z),nand(x,y,z),z)
+		end
+		bor = function(x,y,z)
+		    return nand(bnot(x,z),bnot(y,z),z)
+		end
+		bxor = function(x,y,z)
+		    return band(nand(x,y,z),bor(x,y,z),z)
+		end
+		
+		return {
+			-- bit operations
+			bnot = bnot,
+			band = band,
+			bor  = bor,
+			bxor = bxor,
+			rshift = rshift,
+			lshift = lshift,
+		}
+	end
+	bit = bit_x()
+	
+	util_x = function()
+		local public = {};
+		local private = {};
+		
+		aeslua.util = public;
+		
+		--
+		-- calculate the parity of one byte
+		--
+		function public.byteParity(byte)
+		    byte = bit.bxor(byte, bit.rshift(byte, 4));
+		    byte = bit.bxor(byte, bit.rshift(byte, 2));
+		    byte = bit.bxor(byte, bit.rshift(byte, 1));
+		    return bit.band(byte, 1);
+		end
+		
+		-- 
+		-- get byte at position index
+		--
+		function public.getByte(number, index)
+		    if (index == 0) then
+		        return bit.band(number,0xff);
+		    else
+		        return bit.band(bit.rshift(number, index*8),0xff);
+		    end
+		end
+		
+		
+		--
+		-- put number into int at position index
+		--
+		function public.putByte(number, index)
+		    if (index == 0) then
+		        return bit.band(number,0xff);
+		    else
+		        return bit.lshift(bit.band(number,0xff),index*8);
+		    end
+		end
+		
+		--
+		-- convert byte array to int array
+		--
+		function public.bytesToInts(bytes, start, n)
+		    local ints = {};
+		    for i = 0, n - 1 do
+		        ints[i] = public.putByte(bytes[start + (i*4)    ], 3)
+		                + public.putByte(bytes[start + (i*4) + 1], 2) 
+		                + public.putByte(bytes[start + (i*4) + 2], 1)    
+		                + public.putByte(bytes[start + (i*4) + 3], 0);
+		    end
+		    return ints;
+		end
+		
+		--
+		-- convert int array to byte array
+		--
+		function public.intsToBytes(ints, output, outputOffset, n)
+		    n = n or #ints;
+		    for i = 0, n do
+		        for j = 0,3 do
+		            output[outputOffset + i*4 + (3 - j)] = public.getByte(ints[i], j);
+		        end
+		    end
+		    return output;
+		end
+		
+		--
+		-- convert bytes to hexString
+		--
+		function private.bytesToHex(bytes)
+		    local hexBytes = "";
+		    
+		    for i,byte in ipairs(bytes) do 
+		        hexBytes = hexBytes .. string.format("%02x ", byte);
+		    end
+		
+		    return hexBytes;
+		end
+		
+		--
+		-- convert data to hex string
+		--
+		function public.toHexString(data)
+		    local type = type(data);
+		    if (type == "number") then
+		        return string.format("%08x",data);
+		    elseif (type == "table") then
+		        return private.bytesToHex(data);
+		    elseif (type == "string") then
+		        local bytes = {string.byte(data, 1, #data)}; 
+		
+		        return private.bytesToHex(bytes);
+		    else
+		        return data;
+		    end
+		end
+		
+		function public.padByteString(data)
+		    local dataLength = #data;
+		    
+		    local random1 = math.random(0,255);
+		    local random2 = math.random(0,255);
+		
+		    local prefix = string.char(random1,
+		                               random2,
+		                               random1,
+		                               random2,
+		                               public.getByte(dataLength, 3),
+		                               public.getByte(dataLength, 2),
+		                               public.getByte(dataLength, 1),
+		                               public.getByte(dataLength, 0));
+		
+		    data = prefix .. data;
+		
+		    local paddingLength = math.ceil(#data/16)*16 - #data;
+		    local padding = "";
+		    for i=1,paddingLength do
+		        padding = padding .. string.char(math.random(0,255));
+		    end 
+		
+		    return data .. padding;
+		end
+		
+		function private.properlyDecrypted(data)
+		    local random = {string.byte(data,1,4)};
+		
+		    if (random[1] == random[3] and random[2] == random[4]) then
+		        return true;
+		    end
+		    
+		    return false;
+		end
+		
+		function public.unpadByteString(data)
+		    if (not private.properlyDecrypted(data)) then
+		        return nil;
+		    end
+		
+		    local dataLength = public.putByte(string.byte(data,5), 3)
+		                     + public.putByte(string.byte(data,6), 2) 
+		                     + public.putByte(string.byte(data,7), 1)    
+		                     + public.putByte(string.byte(data,8), 0);
+		    
+		    return string.sub(data,9,8+dataLength);
+		end
+		
+		function public.xorIV(data, iv)
+		    for i = 1,16 do
+		        data[i] = bit.bxor(data[i], iv[i]);
+		    end 
+		end
+		
+		return public;
+	end
+	util = util_x()
+	
+	buffer_x = function()
+		local public = {};
+		
+		aeslua.buffer = public;
+		
+		function public.new ()
+		  return {};
+		end
+		
+		function public.addString (stack, s)
+		  table.insert(stack, s)
+		  for i = #stack - 1, 1, -1 do
+		    if #stack[i] > #stack[i+1] then 
+		        break;
+		    end
+		    stack[i] = stack[i] .. table.remove(stack);
+		  end
+		end
+		
+		function public.toString (stack)
+		  for i = #stack - 1, 1, -1 do
+		    stack[i] = stack[i] .. table.remove(stack);
+		  end
+		  return stack[1];
+		end
+		
+		return public;
+	end
+	buffer = buffer_x()
+
+	gf_x = function()
+		-- finite field with base 2 and modulo irreducible polynom x^8+x^4+x^3+x+1 = 0x11d
+		local private = {};
+		local public = {};
+
+		aeslua.gf = public;
+
+		-- private data of gf
+		private.n = 0x100;
+		private.ord = 0xff;
+		private.irrPolynom = 0x11b;
+		private.exp = {};
+		private.log = {};
+
+		--
+		-- add two polynoms (its simply xor)
+		--
+		function public.add(operand1, operand2) 
+			return bit.bxor(operand1,operand2);
+		end
+
+		-- 
+		-- subtract two polynoms (same as addition)
+		--
+		function public.sub(operand1, operand2) 
+			return bit.bxor(operand1,operand2);
+		end
+
+		--
+		-- inverts element
+		-- a^(-1) = g^(order - log(a))
+		--
+		function public.invert(operand)
+			-- special case for 1 
+			if (operand == 1) then
+				return 1;
+			end;
+			-- normal invert
+			local exponent = private.ord - private.log[operand];
+			return private.exp[exponent];
+		end
+
+		--
+		-- multiply two elements using a logarithm table
+		-- a*b = g^(log(a)+log(b))
+		--
+		function public.mul(operand1, operand2)
+		    if (operand1 == 0 or operand2 == 0) then
+		        return 0;
+		    end
+			
+		    local exponent = private.log[operand1] + private.log[operand2];
+			if (exponent >= private.ord) then
+				exponent = exponent - private.ord;
+			end
+			return  private.exp[exponent];
+		end
+
+		--
+		-- divide two elements
+		-- a/b = g^(log(a)-log(b))
+		--
+		function public.div(operand1, operand2)
+		    if (operand1 == 0)  then
+		        return 0;
+		    end
+		    -- TODO: exception if operand2 == 0
+			local exponent = private.log[operand1] - private.log[operand2];
+			if (exponent < 0) then
+				exponent = exponent + private.ord;
+			end
+			return private.exp[exponent];
+		end
+
+		--
+		-- print logarithmic table
+		--
+		function public.printLog()
+			for i = 1, private.n do
+				print("log(", i-1, ")=", private.log[i-1]);
+			end
+		end
+
+		--
+		-- print exponentiation table
+		--
+		function public.printExp()
+			for i = 1, private.n do
+				print("exp(", i-1, ")=", private.exp[i-1]);
+			end
+		end
+
+		--
+		-- calculate logarithmic and exponentiation table
+		--
+		function private.initMulTable()
+			local a = 1;
+
+			for i = 0,private.ord-1 do
+		    	private.exp[i] = a;
+				private.log[a] = i;
+
+				-- multiply with generator x+1 -> left shift + 1	
+				a = bit.bxor(bit.lshift(a, 1), a);
+
+				-- if a gets larger than order, reduce modulo irreducible polynom
+				if a > private.ord then
+					a = public.sub(a, private.irrPolynom);
+				end
+			end
+		end
+
+		private.initMulTable();
+
+		return public;
+	end
+	gf = gf_x()
+
+	aes_x = function()
+		--
+		-- Implementation of AES with nearly pure lua (only bitlib is needed) 
+		--
+		-- AES with lua is slow, really slow :-)
+		--
+
+		local public = {};
+		local private = {};
+
+		aeslua.aes = public;
+
+		-- some constants
+		public.ROUNDS = "rounds";
+		public.KEY_TYPE = "type";
+		public.ENCRYPTION_KEY=1;
+		public.DECRYPTION_KEY=2;
+
+		-- aes SBOX
+		private.SBox = {};
+		private.iSBox = {};
+
+		-- aes tables
+		private.table0 = {};
+		private.table1 = {};
+		private.table2 = {};
+		private.table3 = {};
+
+		private.tableInv0 = {};
+		private.tableInv1 = {};
+		private.tableInv2 = {};
+		private.tableInv3 = {};
+
+		-- round constants
+		private.rCon = {0x01000000, 
+		                0x02000000, 
+		                0x04000000, 
+		                0x08000000, 
+		                0x10000000, 
+		                0x20000000, 
+		                0x40000000, 
+		                0x80000000, 
+		                0x1b000000, 
+		                0x36000000,
+		                0x6c000000,
+		                0xd8000000,
+		                0xab000000,
+		                0x4d000000,
+		                0x9a000000,
+		                0x2f000000};
+
+		--
+		-- affine transformation for calculating the S-Box of AES
+		--
+		function private.affinMap(byte)
+		    mask = 0xf8;
+		    result = 0;
+		    for i = 1,8 do
+		        result = bit.lshift(result,1);
+
+		        parity = util.byteParity(bit.band(byte,mask)); 
+		        result = result + parity
+
+		        -- simulate roll
+		        lastbit = bit.band(mask, 1);
+		        mask = bit.band(bit.rshift(mask, 1),0xff);
+		        if (lastbit ~= 0) then
+		            mask = bit.bor(mask, 0x80);
+		        else
+		            mask = bit.band(mask, 0x7f);
+		        end
+		    end
+
+		    return bit.bxor(result, 0x63);
+		end
+
+		--
+		-- calculate S-Box and inverse S-Box of AES
+		-- apply affine transformation to inverse in finite field 2^8 
+		--
+		function private.calcSBox() 
+		    for i = 0, 255 do
+		    if (i ~= 0) then
+		        inverse = gf.invert(i);
+		    else
+		        inverse = i;
+		    end
+		        mapped = private.affinMap(inverse);                 
+		        private.SBox[i] = mapped;
+		        private.iSBox[mapped] = i;
+		    end
+		end
+
+		--
+		-- Calculate round tables
+		-- round tables are used to calculate shiftRow, MixColumn and SubBytes 
+		-- with 4 table lookups and 4 xor operations.
+		--
+		function private.calcRoundTables()
+		    for x = 0,255 do
+		        byte = private.SBox[x];
+		        private.table0[x] = util.putByte(gf.mul(0x03, byte), 0)
+		                          + util.putByte(             byte , 1)
+		                          + util.putByte(             byte , 2)
+		                          + util.putByte(gf.mul(0x02, byte), 3);
+		        private.table1[x] = util.putByte(             byte , 0)
+		                          + util.putByte(             byte , 1)
+		                          + util.putByte(gf.mul(0x02, byte), 2)
+		                          + util.putByte(gf.mul(0x03, byte), 3);
+		        private.table2[x] = util.putByte(             byte , 0)
+		                          + util.putByte(gf.mul(0x02, byte), 1)
+		                          + util.putByte(gf.mul(0x03, byte), 2)
+		                          + util.putByte(             byte , 3);
+		        private.table3[x] = util.putByte(gf.mul(0x02, byte), 0)
+		                          + util.putByte(gf.mul(0x03, byte), 1)
+		                          + util.putByte(             byte , 2)
+		                          + util.putByte(             byte , 3);
+		    end
+		end
+
+		--
+		-- Calculate inverse round tables
+		-- does the inverse of the normal roundtables for the equivalent 
+		-- decryption algorithm.
+		--
+		function private.calcInvRoundTables()
+		    for x = 0,255 do
+		        byte = private.iSBox[x];
+		        private.tableInv0[x] = util.putByte(gf.mul(0x0b, byte), 0)
+		                             + util.putByte(gf.mul(0x0d, byte), 1)
+		                             + util.putByte(gf.mul(0x09, byte), 2)
+		                             + util.putByte(gf.mul(0x0e, byte), 3);
+		        private.tableInv1[x] = util.putByte(gf.mul(0x0d, byte), 0)
+		                             + util.putByte(gf.mul(0x09, byte), 1)
+		                             + util.putByte(gf.mul(0x0e, byte), 2)
+		                             + util.putByte(gf.mul(0x0b, byte), 3);
+		        private.tableInv2[x] = util.putByte(gf.mul(0x09, byte), 0)
+		                             + util.putByte(gf.mul(0x0e, byte), 1)
+		                             + util.putByte(gf.mul(0x0b, byte), 2)
+		                             + util.putByte(gf.mul(0x0d, byte), 3);
+		        private.tableInv3[x] = util.putByte(gf.mul(0x0e, byte), 0)
+		                             + util.putByte(gf.mul(0x0b, byte), 1)
+		                             + util.putByte(gf.mul(0x0d, byte), 2)
+		                             + util.putByte(gf.mul(0x09, byte), 3);
+		    end
+		end
+
+
+		--
+		-- rotate word: 0xaabbccdd gets 0xbbccddaa
+		-- used for key schedule
+		--
+		function private.rotWord(word)
+		    local tmp = bit.band(word,0xff000000);
+		    return (bit.lshift(word,8) + bit.rshift(tmp,24)) ;
+		end
+
+		--
+		-- replace all bytes in a word with the SBox.
+		-- used for key schedule
+		--
+		function private.subWord(word)
+		    return util.putByte(private.SBox[util.getByte(word,0)],0) 
+		         + util.putByte(private.SBox[util.getByte(word,1)],1) 
+		         + util.putByte(private.SBox[util.getByte(word,2)],2)
+		         + util.putByte(private.SBox[util.getByte(word,3)],3);
+		end
+
+		--
+		-- generate key schedule for aes encryption
+		--
+		-- returns table with all round keys and
+		-- the necessary number of rounds saved in [public.ROUNDS]
+		--
+		function public.expandEncryptionKey(key)
+		    local keySchedule = {};
+		    local keyWords = math.floor(#key / 4);
+		   
+		 
+		    if ((keyWords ~= 4 and keyWords ~= 6 and keyWords ~= 8) or (keyWords * 4 ~= #key)) then
+		        print("Invalid key size: ", keyWords);
+		        return nil;
+		    end
+
+		    keySchedule[public.ROUNDS] = keyWords + 6;
+		    keySchedule[public.KEY_TYPE] = public.ENCRYPTION_KEY;
+		 
+		    for i = 0,keyWords - 1 do
+		        keySchedule[i] = util.putByte(key[i*4+1], 3) 
+		                       + util.putByte(key[i*4+2], 2)
+		                       + util.putByte(key[i*4+3], 1)
+		                       + util.putByte(key[i*4+4], 0);  
+		    end    
+		   
+		    for i = keyWords, (keySchedule[public.ROUNDS] + 1)*4 - 1 do
+		        local tmp = keySchedule[i-1];
+
+		        if ( i % keyWords == 0) then
+		            tmp = private.rotWord(tmp);
+		            tmp = private.subWord(tmp);
+		            
+		            local index = math.floor(i/keyWords);
+		            tmp = bit.bxor(tmp,private.rCon[index]);
+		        elseif (keyWords > 6 and i % keyWords == 4) then
+		            tmp = private.subWord(tmp);
+		        end
+		        
+		        keySchedule[i] = bit.bxor(keySchedule[(i-keyWords)],tmp);
+		    end
+
+		    return keySchedule;
+		end
+
+		--
+		-- Inverse mix column
+		-- used for key schedule of decryption key
+		--
+		function private.invMixColumnOld(word)
+		    local b0 = util.getByte(word,3);
+		    local b1 = util.getByte(word,2);
+		    local b2 = util.getByte(word,1);
+		    local b3 = util.getByte(word,0);
+		     
+		    return util.putByte(gf.add(gf.add(gf.add(gf.mul(0x0b, b1), 
+		                                             gf.mul(0x0d, b2)), 
+		                                             gf.mul(0x09, b3)), 
+		                                             gf.mul(0x0e, b0)),3)
+		         + util.putByte(gf.add(gf.add(gf.add(gf.mul(0x0b, b2), 
+		                                             gf.mul(0x0d, b3)), 
+		                                             gf.mul(0x09, b0)), 
+		                                             gf.mul(0x0e, b1)),2)
+		         + util.putByte(gf.add(gf.add(gf.add(gf.mul(0x0b, b3), 
+		                                             gf.mul(0x0d, b0)), 
+		                                             gf.mul(0x09, b1)), 
+		                                             gf.mul(0x0e, b2)),1)
+		         + util.putByte(gf.add(gf.add(gf.add(gf.mul(0x0b, b0), 
+		                                             gf.mul(0x0d, b1)), 
+		                                             gf.mul(0x09, b2)), 
+		                                             gf.mul(0x0e, b3)),0);
+		end
+
+		-- 
+		-- Optimized inverse mix column
+		-- look at http://fp.gladman.plus.com/cryptography_technology/rijndael/aes.spec.311.pdf
+		-- TODO: make it work
+		--
+		function private.invMixColumn(word)
+		    local b0 = util.getByte(word,3);
+		    local b1 = util.getByte(word,2);
+		    local b2 = util.getByte(word,1);
+		    local b3 = util.getByte(word,0);
+		    
+		    local t = bit.bxor(b3,b2);
+		    local u = bit.bxor(b1,b0);
+		    local v = bit.bxor(t,u);
+		    v = bit.bxor(v,gf.mul(0x08,v));
+		    w = bit.bxor(v,gf.mul(0x04, bit.bxor(b2,b0)));
+		    v = bit.bxor(v,gf.mul(0x04, bit.bxor(b3,b1)));
+		    
+		    return util.putByte( bit.bxor(bit.bxor(b3,v), gf.mul(0x02, bit.bxor(b0,b3))), 0)
+		         + util.putByte( bit.bxor(bit.bxor(b2,w), gf.mul(0x02, t              )), 1)
+		         + util.putByte( bit.bxor(bit.bxor(b1,v), gf.mul(0x02, bit.bxor(b0,b3))), 2)
+		         + util.putByte( bit.bxor(bit.bxor(b0,w), gf.mul(0x02, u              )), 3);
+		end
+
+		--
+		-- generate key schedule for aes decryption
+		--
+		-- uses key schedule for aes encryption and transforms each
+		-- key by inverse mix column. 
+		--
+		function public.expandDecryptionKey(key)
+		    local keySchedule = public.expandEncryptionKey(key);
+		    if (keySchedule == nil) then
+		        return nil;
+		    end
+		    
+		    keySchedule[public.KEY_TYPE] = public.DECRYPTION_KEY;    
+
+		    for i = 4, (keySchedule[public.ROUNDS] + 1)*4 - 5 do
+		        keySchedule[i] = private.invMixColumnOld(keySchedule[i]);
+		    end
+		    
+		    return keySchedule;
+		end
+
+		--
+		-- xor round key to state
+		--
+		function private.addRoundKey(state, key, round)
+		    for i = 0, 3 do
+		        state[i] = bit.bxor(state[i], key[round*4+i]);
+		    end
+		end
+
+		--
+		-- do encryption round (ShiftRow, SubBytes, MixColumn together)
+		--
+		function private.doRound(origState, dstState)
+		    dstState[0] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.table0[util.getByte(origState[0],3)],
+		                private.table1[util.getByte(origState[1],2)]),
+		                private.table2[util.getByte(origState[2],1)]),
+		                private.table3[util.getByte(origState[3],0)]);
+
+		    dstState[1] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.table0[util.getByte(origState[1],3)],
+		                private.table1[util.getByte(origState[2],2)]),
+		                private.table2[util.getByte(origState[3],1)]),
+		                private.table3[util.getByte(origState[0],0)]);
+		    
+		    dstState[2] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.table0[util.getByte(origState[2],3)],
+		                private.table1[util.getByte(origState[3],2)]),
+		                private.table2[util.getByte(origState[0],1)]),
+		                private.table3[util.getByte(origState[1],0)]);
+		    
+		    dstState[3] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.table0[util.getByte(origState[3],3)],
+		                private.table1[util.getByte(origState[0],2)]),
+		                private.table2[util.getByte(origState[1],1)]),
+		                private.table3[util.getByte(origState[2],0)]);
+		end
+
+		--
+		-- do last encryption round (ShiftRow and SubBytes)
+		--
+		function private.doLastRound(origState, dstState)
+		    dstState[0] = util.putByte(private.SBox[util.getByte(origState[0],3)], 3)
+		                + util.putByte(private.SBox[util.getByte(origState[1],2)], 2)
+		                + util.putByte(private.SBox[util.getByte(origState[2],1)], 1)
+		                + util.putByte(private.SBox[util.getByte(origState[3],0)], 0);
+
+		    dstState[1] = util.putByte(private.SBox[util.getByte(origState[1],3)], 3)
+		                + util.putByte(private.SBox[util.getByte(origState[2],2)], 2)
+		                + util.putByte(private.SBox[util.getByte(origState[3],1)], 1)
+		                + util.putByte(private.SBox[util.getByte(origState[0],0)], 0);
+
+		    dstState[2] = util.putByte(private.SBox[util.getByte(origState[2],3)], 3)
+		                + util.putByte(private.SBox[util.getByte(origState[3],2)], 2)
+		                + util.putByte(private.SBox[util.getByte(origState[0],1)], 1)
+		                + util.putByte(private.SBox[util.getByte(origState[1],0)], 0);
+
+		    dstState[3] = util.putByte(private.SBox[util.getByte(origState[3],3)], 3)
+		                + util.putByte(private.SBox[util.getByte(origState[0],2)], 2)
+		                + util.putByte(private.SBox[util.getByte(origState[1],1)], 1)
+		                + util.putByte(private.SBox[util.getByte(origState[2],0)], 0);
+		end
+
+		--
+		-- do decryption round 
+		--
+		function private.doInvRound(origState, dstState)
+		    dstState[0] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.tableInv0[util.getByte(origState[0],3)],
+		                private.tableInv1[util.getByte(origState[3],2)]),
+		                private.tableInv2[util.getByte(origState[2],1)]),
+		                private.tableInv3[util.getByte(origState[1],0)]);
+
+		    dstState[1] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.tableInv0[util.getByte(origState[1],3)],
+		                private.tableInv1[util.getByte(origState[0],2)]),
+		                private.tableInv2[util.getByte(origState[3],1)]),
+		                private.tableInv3[util.getByte(origState[2],0)]);
+		    
+		    dstState[2] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.tableInv0[util.getByte(origState[2],3)],
+		                private.tableInv1[util.getByte(origState[1],2)]),
+		                private.tableInv2[util.getByte(origState[0],1)]),
+		                private.tableInv3[util.getByte(origState[3],0)]);
+		    
+		    dstState[3] =  bit.bxor(bit.bxor(bit.bxor(
+		                private.tableInv0[util.getByte(origState[3],3)],
+		                private.tableInv1[util.getByte(origState[2],2)]),
+		                private.tableInv2[util.getByte(origState[1],1)]),
+		                private.tableInv3[util.getByte(origState[0],0)]);
+		end
+
+		--
+		-- do last decryption round
+		--
+		function private.doInvLastRound(origState, dstState)
+		    dstState[0] = util.putByte(private.iSBox[util.getByte(origState[0],3)], 3)
+		                + util.putByte(private.iSBox[util.getByte(origState[3],2)], 2)
+		                + util.putByte(private.iSBox[util.getByte(origState[2],1)], 1)
+		                + util.putByte(private.iSBox[util.getByte(origState[1],0)], 0);
+
+		    dstState[1] = util.putByte(private.iSBox[util.getByte(origState[1],3)], 3)
+		                + util.putByte(private.iSBox[util.getByte(origState[0],2)], 2)
+		                + util.putByte(private.iSBox[util.getByte(origState[3],1)], 1)
+		                + util.putByte(private.iSBox[util.getByte(origState[2],0)], 0);
+
+		    dstState[2] = util.putByte(private.iSBox[util.getByte(origState[2],3)], 3)
+		                + util.putByte(private.iSBox[util.getByte(origState[1],2)], 2)
+		                + util.putByte(private.iSBox[util.getByte(origState[0],1)], 1)
+		                + util.putByte(private.iSBox[util.getByte(origState[3],0)], 0);
+
+		    dstState[3] = util.putByte(private.iSBox[util.getByte(origState[3],3)], 3)
+		                + util.putByte(private.iSBox[util.getByte(origState[2],2)], 2)
+		                + util.putByte(private.iSBox[util.getByte(origState[1],1)], 1)
+		                + util.putByte(private.iSBox[util.getByte(origState[0],0)], 0);
+		end
+
+		--
+		-- encrypts 16 Bytes
+		-- key           encryption key schedule
+		-- input         array with input data
+		-- inputOffset   start index for input
+		-- output        array for encrypted data
+		-- outputOffset  start index for output
+		--
+		function public.encrypt(key, input, inputOffset, output, outputOffset) 
+		    --default parameters
+		    inputOffset = inputOffset or 1;
+		    output = output or {};
+		    outputOffset = outputOffset or 1;
+
+		    local state = {};
+		    local tmpState = {};
+		    
+		    if (key[public.KEY_TYPE] ~= public.ENCRYPTION_KEY) then
+		        print("No encryption key: ", key[public.KEY_TYPE]);
+		        return;
+		    end
+
+		    state = util.bytesToInts(input, inputOffset, 4);
+		    private.addRoundKey(state, key, 0);
+
+		    local round = 1;
+		    while (round < key[public.ROUNDS] - 1) do
+		        -- do a double round to save temporary assignments
+		        private.doRound(state, tmpState);
+		        private.addRoundKey(tmpState, key, round);
+		        round = round + 1;
+
+		        private.doRound(tmpState, state);
+		        private.addRoundKey(state, key, round);
+		        round = round + 1;
+		    end
+		    
+		    private.doRound(state, tmpState);
+		    private.addRoundKey(tmpState, key, round);
+		    round = round +1;
+
+		    private.doLastRound(tmpState, state);
+		    private.addRoundKey(state, key, round);
+		    
+		    return util.intsToBytes(state, output, outputOffset);
+		end
+
+		--
+		-- decrypt 16 bytes
+		-- key           decryption key schedule
+		-- input         array with input data
+		-- inputOffset   start index for input
+		-- output        array for decrypted data
+		-- outputOffset  start index for output
+		---
+		function public.decrypt(key, input, inputOffset, output, outputOffset) 
+		    -- default arguments
+		    inputOffset = inputOffset or 1;
+		    output = output or {};
+		    outputOffset = outputOffset or 1;
+
+		    local state = {};
+		    local tmpState = {};
+
+		    if (key[public.KEY_TYPE] ~= public.DECRYPTION_KEY) then
+		        print("No decryption key: ", key[public.KEY_TYPE]);
+		        return;
+		    end
+
+		    state = util.bytesToInts(input, inputOffset, 4);
+		    private.addRoundKey(state, key, key[public.ROUNDS]);
+
+		    local round = key[public.ROUNDS] - 1;
+		    while (round > 2) do
+		        -- do a double round to save temporary assignments
+		        private.doInvRound(state, tmpState);
+		        private.addRoundKey(tmpState, key, round);
+		        round = round - 1;
+
+		        private.doInvRound(tmpState, state);
+		        private.addRoundKey(state, key, round);
+		        round = round - 1;
+		    end
+		    
+		    private.doInvRound(state, tmpState);
+		    private.addRoundKey(tmpState, key, round);
+		    round = round - 1;
+
+		    private.doInvLastRound(tmpState, state);
+		    private.addRoundKey(state, key, round);
+		    
+		    return util.intsToBytes(state, output, outputOffset);
+		end
+
+		-- calculate all tables when loading this file
+		private.calcSBox();
+		private.calcRoundTables();
+		private.calcInvRoundTables();
+
+		return public;
+	end
+	aes = aes_x()
+	
+	ciphermode_x = function()
+		local public = {};
+		
+		aeslua.ciphermode = public;
+		
+		--
+		-- Encrypt strings
+		-- key - byte array with key
+		-- string - string to encrypt
+		-- modefunction - function for cipher mode to use
+		--
+		function public.encryptString(key, data, modeFunction)
+		    local iv = iv or {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+		    local keySched = aes.expandEncryptionKey(key);
+		    local encryptedData = buffer.new();
+		    
+		    for i = 1, #data/16 do
+		        local offset = (i-1)*16 + 1;
+		        local byteData = {string.byte(data,offset,offset +15)};
+				
+		        modeFunction(keySched, byteData, iv);
+		
+		        buffer.addString(encryptedData, string.char(unpack(byteData)));    
+		    end
+		    
+		    return buffer.toString(encryptedData);
+		end
+		
+		--
+		-- the following 4 functions can be used as 
+		-- modefunction for encryptString
+		--
+		
+		-- Electronic code book mode encrypt function
+		function public.encryptECB(keySched, byteData, iv) 
+			aes.encrypt(keySched, byteData, 1, byteData, 1);
+		end
+		
+		-- Cipher block chaining mode encrypt function
+		function public.encryptCBC(keySched, byteData, iv) 
+		    util.xorIV(byteData, iv);
+		
+		    aes.encrypt(keySched, byteData, 1, byteData, 1);    
+		        
+		    for j = 1,16 do
+		        iv[j] = byteData[j];
+		    end
+		end
+		
+		-- Output feedback mode encrypt function
+		function public.encryptOFB(keySched, byteData, iv) 
+		    aes.encrypt(keySched, iv, 1, iv, 1);
+		    util.xorIV(byteData, iv);
+		end
+		
+		-- Cipher feedback mode encrypt function
+		function public.encryptCFB(keySched, byteData, iv) 
+		    aes.encrypt(keySched, iv, 1, iv, 1);    
+		    util.xorIV(byteData, iv);
+		       
+		    for j = 1,16 do
+		        iv[j] = byteData[j];
+		    end        
+		end
+		
+		--
+		-- Decrypt strings
+		-- key - byte array with key
+		-- string - string to decrypt
+		-- modefunction - function for cipher mode to use
+		--
+		function public.decryptString(key, data, modeFunction)
+		    local iv = iv or {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+		    
+		    local keySched;
+		    if (modeFunction == public.decryptOFB or modeFunction == public.decryptCFB) then
+		    	keySched = aes.expandEncryptionKey(key);
+		   	else
+		   		keySched = aes.expandDecryptionKey(key);
+		    end
+		    
+		    local decryptedData = buffer.new();
+		
+		    for i = 1, #data/16 do
+		        local offset = (i-1)*16 + 1;
+		        local byteData = {string.byte(data,offset,offset +15)};
+		
+				iv = modeFunction(keySched, byteData, iv);
+		
+		        buffer.addString(decryptedData, string.char(unpack(byteData)));
+		    end
+		
+		    return buffer.toString(decryptedData);    
+		end
+		
+		--
+		-- the following 4 functions can be used as 
+		-- modefunction for decryptString
+		--
+		
+		-- Electronic code book mode decrypt function
+		function public.decryptECB(keySched, byteData, iv) 
+		
+		    aes.decrypt(keySched, byteData, 1, byteData, 1);
+		    
+		    return iv;
+		end
+		
+		-- Cipher block chaining mode decrypt function
+		function public.decryptCBC(keySched, byteData, iv) 
+			local nextIV = {};
+		    for j = 1,16 do
+		        nextIV[j] = byteData[j];
+		    end
+		        
+		    aes.decrypt(keySched, byteData, 1, byteData, 1);    
+		    util.xorIV(byteData, iv);
+		
+			return nextIV;
+		end
+		
+		-- Output feedback mode decrypt function
+		function public.decryptOFB(keySched, byteData, iv) 
+		    aes.encrypt(keySched, iv, 1, iv, 1);
+		    util.xorIV(byteData, iv);
+		    
+		    return iv;
+		end
+		
+		-- Cipher feedback mode decrypt function
+		function public.decryptCFB(keySched, byteData, iv) 
+		    local nextIV = {};
+		    for j = 1,16 do
+		        nextIV[j] = byteData[j];
+		    end
+		
+		    aes.encrypt(keySched, iv, 1, iv, 1);
+		        
+		    util.xorIV(byteData, iv);
+		    
+		    return nextIV;
+		end
+		
+		return public;	
+		
+	end
+	ciphermode = ciphermode_x()
+
+	
+	function private.pwToKey(password, keyLength)
+	    local padLength = keyLength;
+	    if (keyLength == public.AES192) then
+	        padLength = 32;
+	    end
+	    
+	    if (padLength > #password) then
+	        local postfix = "";
+	        for i = 1,padLength - #password do
+	            postfix = postfix .. string.char(0);
+	        end
+	        password = password .. postfix;
+	    else
+	        password = string.sub(password, 1, padLength);
+	    end
+	    
+	    local pwBytes = {string.byte(password,1,#password)};
+	    password = ciphermode.encryptString(pwBytes, password, ciphermode.encryptCBC);
+	    
+	    password = string.sub(password, 1, keyLength);
+	   
+	    return {string.byte(password,1,#password)};
+	end
+	--
+	-- Encrypts string data with password password.
+	-- password  - the encryption key is generated from this string
+	-- data      - string to encrypt (must not be too large)
+	-- keyLength - length of aes key: 128(default), 192 or 256 Bit
+	-- mode      - mode of encryption: ecb, cbc(default), ofb, cfb 
+	--
+	-- mode and keyLength must be the same for encryption and decryption.
+	--
+	function public.encrypt(password, data, keyLength, mode)
+		assert(password ~= nil, "Empty password.");
+		assert(password ~= nil, "Empty data.");
+		 
+	    local mode = mode or public.CBCMODE;
+	    local keyLength = keyLength or public.AES128;
+	
+	    local key = private.pwToKey(password, keyLength);
+	
+	    local paddedData = util.padByteString(data);
+	    
+	    if (mode == public.ECBMODE) then
+	        return ciphermode.encryptString(key, paddedData, ciphermode.encryptECB);
+	    elseif (mode == public.CBCMODE) then
+	        return ciphermode.encryptString(key, paddedData, ciphermode.encryptCBC);
+	    elseif (mode == public.OFBMODE) then
+	        return ciphermode.encryptString(key, paddedData, ciphermode.encryptOFB);
+	    elseif (mode == public.CFBMODE) then
+	        return ciphermode.encryptString(key, paddedData, ciphermode.encryptCFB);
+	    else
+	        return nil;
+	    end
+	end
+	
+	--
+	-- Decrypts string data with password password.
+	-- password  - the decryption key is generated from this string
+	-- data      - string to encrypt
+	-- keyLength - length of aes key: 128(default), 192 or 256 Bit
+	-- mode      - mode of decryption: ecb, cbc(default), ofb, cfb 
+	--
+	-- mode and keyLength must be the same for encryption and decryption.
+	--
+	function public.decrypt(password, data, keyLength, mode)
+	    local mode = mode or public.CBCMODE;
+	    local keyLength = keyLength or public.AES128;
+	
+	    local key = private.pwToKey(password, keyLength);
+	    
+	    local plain;
+	    if (mode == public.ECBMODE) then
+	        plain = ciphermode.decryptString(key, data, ciphermode.decryptECB);
+	    elseif (mode == public.CBCMODE) then
+	        plain = ciphermode.decryptString(key, data, ciphermode.decryptCBC);
+	    elseif (mode == public.OFBMODE) then
+	        plain = ciphermode.decryptString(key, data, ciphermode.decryptOFB);
+	    elseif (mode == public.CFBMODE) then
+	        plain = ciphermode.decryptString(key, data, ciphermode.decryptCFB);
+	    end
+	    
+	    result = util.unpadByteString(plain);
+	    
+	    if (result == nil) then
+	        return nil;
+	    end
+	    
+	    return result;
+	end
+	
+	return public;
+end
+-- intentionally NOT calling aesLua_x() here, because that takes a long time. Lazy load instead.
+
+-- http://lua-users.org/wiki/BaseSixtyFour
+-- Lua 5.1+ base64 v3.0 (c) 2009 by Alex Kloss <alexthkloss@web.de>
+-- licensed under the terms of the LGPL2
+base64_x = function()
+	-- character table string
+	local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+	-- encoding
+	function encode(data)
+	    return ((data:gsub('.', function(x) 
+	        local r,b='',x:byte()
+	        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+	        return r;
+	    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+	        if (#x < 6) then return '' end
+	        local c=0
+	        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+	        return b:sub(c+1,c+1)
+	    end)..({ '', '==', '=' })[#data%3+1])
+	end
+
+	-- decoding
+	function decode(data)
+		  data = string.gsub(data, '[^'..b..'=]', '')
+			return (data:gsub('.', function(x)
+	        if (x == '=') then return '' end
+	        local r,f='',(b:find(x)-1)
+	        for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+	        return r;
+	    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+	        if (#x ~= 8) then return '' end
+	        local c=0
+	        for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+	        return string.char(c)
+	    end))
+	end
+	return {encode = encode, decode = decode}
+end
+base64 = base64_x()
+
+encrypt = nil
+decrypt = nil
+b64_encode = nil
+b64_decode = nil
+aes_l = nil -- lazy load
+
+function onLoad(save_state)
+	encrypt = function(options)
+		if aes_l == nil then
+			broadcastToAll("Loading crypto functions...", {1,1,1})
+			aes_l = aesLua_x()
+			broadcastToAll("Done.", {1,1,1})
+		end
+		
+		addNotebookTab({['title'] = 'Encrypt', ['body'] = JSON.encode(options)})
+		
+		password = options['password']
+		keylen = options['keyLength']
+		if forcedmode ~= nil then
+			mode = options['mode']
+		else
+			mode = forcedmode
+		end
+		
+		-- -- encode the data before encrypting to protect against weirdness in the plaintext
+		-- str = base64.encode(options['data'])
+		str = options['data']
+		addNotebookTab({['title'] = 'Encrypt 2', ['body'] = str})
+		
+		-- Because this library has issues with strings > 256 char, split the string into 256-char substrings and encode them separately.
+		-- This is, obviously, a cryptographic vulnerability. Hopefully you're not actually using TTS for something important?
+		-- While at it, encrypt a signal value so we can early abort on decryption attempts.
+		t = {}
+		len = string.len(str)
+		i = 1 -- not 0
+		
+		local bytes_table = { string.byte(str, 1, -1) }
+		addNotebookTab({['title'] = 'Encrypt 3', ['body'] = JSON.encode(bytes_table)})
+		-- n = 1
+		-- todo = math.ceil(len / splitlen)
+		-- while i < len do
+			-- broadcastToAll("Encrypting (" .. n .. "/" .. todo .. ") ...", {1,1,1})
+			broadcastToAll("Encrypting ...", {1,1,1})
+			-- n = n + 1
+			-- j = i + (splitlen - 1)
+			-- if j > len then j = -1 end
+			-- substr = string.sub(str, i, j)
+			-- if #substr < splitlen then
+			-- 	substr = substr .. string.rep(' ', splitlen - #substr) -- pad it to 256 char with spaces at end
+			-- end
+			-- substr = str
+			
+			-- addNotebookTab({['title'] = 'Encrypt iteration ' .. n, ['body'] = "n " .. n .. " i " .. i .. " j " .. j .. " len " .. len .. ' #substr ' .. #substr})
+			-- addNotebookTab({['title'] = 'Encrypt iteration', ['body'] = " len " .. len .. ' #substr ' .. #substr})
+			-- table.insert(t, base64.encode(aes_l.encrypt(password, base64.encode(substr), keylen, mode)))
+
+			table.insert(t, base64.encode(aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode)))
+
+
+			addNotebookTab({
+				['title'] = 'Encrypt 3.5 encrypted', ['body'] = JSON.encode(
+					table.concat(
+						{string.byte(
+							aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode),
+							1,-1
+						)},
+						','
+					)
+				)
+			})
+			addNotebookTab({
+				['title'] = 'Encrypt 3.5 encrypted decrypted', ['body'] = JSON.encode(
+					table.concat(
+						{string.byte(
+							aes_l.decrypt(password, aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode), keylen, mode),
+							1,-1
+						)},
+						','
+					)
+				)
+			})
+			addNotebookTab({
+				['title'] = 'Encrypt 3.5 encrypted base64', ['body'] = JSON.encode(
+					table.concat(
+						{string.byte(
+							base64.encode(aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode)),
+							1,-1
+						)},
+						','
+					)
+				)
+			})
+			addNotebookTab({
+				['title'] = 'Encrypt 3.5 encrypted base64 debase64', ['body'] = JSON.encode(
+					table.concat(
+						{string.byte(
+							base64.decode(base64.encode(aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode))),
+							1,-1
+						)},
+						','
+					)
+				)
+			})
+			addNotebookTab({
+				['title'] = 'Encrypt 3.5 encrypted base64 debase64', ['body'] = JSON.encode(
+					table.concat(
+						{string.byte(
+							aes_l.decrypt(pssword, base64.decode(base64.encode(aes_l.encrypt(password, table.concat(bytes_table, ","), keylen, mode))), keylen, mode),
+							1,-1
+						)},
+						','
+					)
+				)
+			})
+			-- i = i + splitlen
+		-- end
+		
+		to_save = {
+			['signal'] = base64.encode(aes_l.encrypt(password, "This was a triumph.", keylen, mode)), -- 3
+			['cyphertext'] = t
+		}
+		addNotebookTab({['title'] = 'Encrypt 4', ['body'] = JSON.encode(to_save)})
+		
+		broadcastToAll("Encrypting done.", {1,1,1})
+		js = JSON.encode(to_save)
+		return base64.encode(js)
+	end
+
+	-- -- https://www.lua.org/pil/11.6.html
+	-- function newStack ()
+	-- 	return {""}   -- starts with an empty string
+	-- end
+	-- 
+	-- function addString (stack, s)
+	-- 	table.insert(stack, s)    -- push 's' into the the stack
+	-- 	for i=table.getn(stack)-1, 1, -1 do
+	-- 		if string.len(stack[i]) > string.len(stack[i+1]) then
+	-- 			break
+	-- 		end
+	-- 		stack[i] = stack[i] .. table.remove(stack)
+	-- 	end
+	-- end
+	-- 
+	
+	do
+	  local bytemarkers = { {0x7FF,192}, {0xFFFF,224}, {0x1FFFFF,240} }
+	  function utf8(decimal)
+	    if decimal<128 then return string.char(decimal) end
+	    local charbytes = {}
+	    for bytes,vals in ipairs(bytemarkers) do
+	      if decimal<=vals[1] then
+	        for b=bytes+1,2,-1 do
+	          local mod = decimal%64
+	          decimal = (decimal-mod)/64
+	          charbytes[b] = string.char(128+mod)
+	        end
+	        charbytes[1] = string.char(vals[2]+decimal)
+	        break
+	      end
+	    end
+	    return table.concat(charbytes)
+	  end
+	end
+	
+	function utf8frompoints(...)
+	  local chars,arg={},{...}
+	  for i,n in ipairs(arg) do chars[i]=utf8(arg[i]) end
+	  return table.concat(chars)
+	end
+
+	
+	decrypt = function(options)
+		if aes_l == nil then
+			broadcastToAll("Loading crypto functions...", {1,1,1})
+			aes_l = aesLua_x()
+			broadcastToAll("Done.", {1,1,1})
+		end
+		
+		addNotebookTab({['title'] = 'Decrypt', ['body'] = JSON.encode(options)})
+		
+		password = options['password']
+		keylen = options['keyLength']
+		if forcedmode ~= nil then
+			mode = options['mode']
+		else
+			mode = forcedmode
+		end
+
+		js = base64.decode(options['data'])
+		addNotebookTab({['title'] = 'Decrypt 2', ['body'] = js})
+		from_save = JSON.decode(js)
+		assert(from_save['signal'] ~= nil, "failed to decode cyphertext wrapper")
+		
+		-- check signal and early abort
+		assert(aes_l.decrypt(password, base64.decode(from_save['signal']), keylen, mode) == "This was a triumph.", "Decryption failed - bad password or cyphertext.")
+		
+		broadcastToAll("Password validated.", {1,1,1})
+		
+		todo = #from_save['cyphertext']
+		encrypted_t = from_save['cyphertext']
+		t = {}
+		str2 = ""
+		a = 0
+		b = 0
+		addNotebookTab({['title'] = 'Decrypt 3', ['body'] = JSON.encode(encrypted_t)})
+		-- local s = newStack()
+		for index, str in ipairs(encrypted_t) do
+			broadcastToAll("Decrypting (" .. index .. "/" .. todo .. ") ...", {1,1,1})
+			str_debase64 = base64.decode(str)
+			addNotebookTab({['title'] = 'Decrypt 3.1 ' .. index, ['body'] = JSON.encode(str_debase64)})
+			str_decrypted = aes_l.decrypt(password, str_debase64, keylen, mode)
+			addNotebookTab({['title'] = 'Decrypt 3.2 ' .. index, ['body'] = JSON.encode(str_decrypted)})
+			
+			decrypted_t = {}
+			for i in string.gmatch(str_decrypted, "[^,]+") do
+				table.insert(decrypted_t, string.char(i))
+			end
+			addNotebookTab({['title'] = 'Decrypt 3.3', ['body'] = JSON.encode(decrypted_t)})
+			dec = table.concat(decrypted_t)
+			-- dec = base64.decode(str_decrypted)
+			-- dec = utf8frompoints(str_decrypted)
+			-- string.char(1,2,3,4....)
+			addNotebookTab({['title'] = 'Decrypt 3.3 ' .. index, ['body'] = JSON.encode(dec)})
+			
+			t1 = os.time()
+			str2 = str2 .. dec
+			a = a + (os.time() - t1)
+			-- addString(s, dec)
+			t1 = os.time()
+			table.insert(t, dec)
+			b = b + (os.time() - t1)
+			addNotebookTab({['title'] = 'Decrypt iteration ' .. index, ['body'] = "index " .. index .. " a " .. a .. " b " .. b .. "str " .. str .. " b64d " .. base64.decode(str) .. " decrypted " .. dec})
+		end
+		-- s = toString(s)
+		t1 = os.time()
+		s = table.concat(t)
+		b = b + (os.time() - t1)
+		print(a)
+		print(b)
+		
+		addNotebookTab({['title'] = 'Decrypted', ['body'] = s})
+		addNotebookTab({['title'] = 'Decrypted', ['body'] = str2})
+		-- addNotebookTab({['title'] = 'Decrypted 2', ['body'] = base64.decode(s)})
+		-- addNotebookTab({['title'] = 'Decrypted 2', ['body'] = base64.decode(str2)})
+		
+		-- return base64.decode(s)
+		return s
+	end
+	
+	b64_encode = function(options)
+		return base64.encode(options[1])
+	end
+	
+	b64_decode = function(options)
+		return base64.decode(options[1])
+	end
+	
+	Global.setVar("encryptProvider", self)
+	return {encrypt = encrypt, decrypt = decrypt, b64_decode = b64_decode, b64_encode = b64_encode}
+end
+
+-- 
+-- For running separately in REPL, to substitute out the TTS stuff
+print("\n\nRunning... " .. os.time())
+function addNotebookTab(opt)
+	print('addNotebookTab')
+	print(opt.title)
+	print(opt.body)
+end
+function broadcastToAll(text, color)
+	print('broadcastToAll')
+	print(text)
+end
+function sendExternalMessage(obj)
+	print("sendExternalMessage")
+	for i, s in ipairs(obj) do
+		if i > 30 then break end
+		print("i " .. i .. " s " .. s)
+	end
+end
+ff = nil
+print 'loading'
+require('json')
+JSON = json
+-- JSON = {
+-- 	['encode'] = function(txt)
+-- 		return txt
+-- 	end,
+-- 	['decode'] = function(txt)
+-- 		return txt
+-- 	end
+-- }
+Global = {
+	['setVar'] = function(v, k)
+		ff = k
+		if k == nil then k = 'nil' end
+		print('setVar ' .. v .. ' = ' .. k)
+	end,
+	['getVar'] = function(v)
+		print('getVar ' .. v)
+		print(ff)
+		return ff
+	end
+}
+print(Global)
+print('onLoad')
+ff = onLoad({})
+print(ff)
+print(Global)
+print('loading done')
+-- 
+-- local text = {
+-- 	["password"] = "Mellon",
+-- 	["data"] = "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur? Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur?"
+-- }
+
+
+text = {
+	["password"] = "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur? Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur?",
+	["data"] = [===[
+	-- Simple API for encrypting strings.
+	-- Lua AES code from https://github.com/bighil/aeslua
+	---  Note: https://github.com/SquidDev-CC/aeslua is buggy for long strings. Do not use.
+	-- lua Base64 code from http://lua-users.org/wiki/BaseSixtyFour
+	-- Lua bitwise code from http://lua-users.org/wiki/BitUtils
+	-- Padlock image from https://commons.wikimedia.org/wiki/File:Padlock-bronze-open_and_silver-medium.svg
+	-- Imported to TTS by Sai (saizai)
+	-- Source: https://github.com/saizai/tts_encrypter
+
+	-- Notes:
+	-- 1. It's SLOW. 
+	--	 		Seriously. Lua is not meant to handle crypto, and this is pure Lua (because TTS doesn't even provide the bit library).
+	-- 			So, yes, you can do AES256. But it'll take a while.
+	--      It will take significant time, and make TTS unresponsive for a while, even in the best of circumstances. Just let it run.
+	-- 2. It's buggy.
+	--      Strings longer than 256 chars, especially in modes other than 3 (OFB), do not work right. They decrypt lossily. I don't know why.
+	--      In the meantime, I'm limiting it to mode 3, and chopping it up into 256 char chunks.
+	-- 3. It's not very secure.
+	--      The workaround to #2 - using OFB and separate 256-char chunks encrypted with the same key - makes this more vulnerable than if it were encrypted as a whole.
+	--      This is TTS, not Signal. Don't use it for something serious.
+	-- 4. It's lazy loaded to reduce impact.
+	--      Booting up the encryption libraries takes some time. They aren't actually loaded until you use an encrypt or decrypt function. This saves load time dramatically, but it'll choke up when you first use it.
+	-- 
+	-- -- Call like so:
+	-- local text = {
+	-- 	["password"] = "Mellon",
+	-- 	["data"] = "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur? Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur?"
+	-- }
+	-- cyphertext = Global.getVar("encryptProvider").call("encrypt", text)
+	-- print(cyphertext)
+	-- -- encrypt returns base64 encoded string
+	-- text['data'] = cyphertext
+	-- plaintext = Global.getVar("encryptProvider").call("decrypt", text)
+	-- print(plaintext)
+	-- -- decrypt gives an error if wrong pass or wrong cyphertext, plaintext string otherwise
+
+	-- -- This item also provides Base64 encode/decode functions. They're already used for the encryption.
+	-- encoded = Global.getVar("encryptProvider").call("b64_encode", {[1] = "string to encode"})
+	-- print(encoded)
+	-- decoded = Global.getVar("encryptProvider").call("b64_decode", {[1] = "c3RyaW5nIHRvIGVuY29kZQ=="})
+	-- print(decoded)
+
+	]===]
+}
+print(text)
+print('encrypting')
+cyphertext = ff.encrypt(text)
+print('cyphertext')
+print(cyphertext)
+-- encrypt returns base64 encoded string
+text['data'] = cyphertext
+print('decrypting')
+plaintext = ff.decrypt(text)
+print('plaintext')
+print(plaintext)
